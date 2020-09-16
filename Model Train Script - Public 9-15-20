@@ -1,0 +1,636 @@
+import pandas as pd
+import numpy as np
+import keras
+import tensorflow as tf
+from tensorflow.python.keras import layers
+from keras.layers import Input, Dense, Lambda
+from keras import backend as K
+from keras.models import Model
+from keras import objectives
+import matplotlib.pyplot as plt
+
+data=pd.read_csv("Import MIMIC data from local file")
+data=data.drop(["Unnamed: 0","X"],axis=1)
+
+#Need to get rid of Gender, Age, Weight, Pulmonary_Embolism, SOFA_Overall, Heparin_Adj
+data=data.drop(["SOFA_Overall","Gender","Age","Weight","Pulmonary_Embolism","Heparin_Adj"],axis=1)
+
+ind=np.unique(np.array(data.INDEX))
+dataX=data; dataY=data
+
+counter=0
+for i in ind:
+    counter=counter+1;print(counter/len(ind))
+    hours=data[data.INDEX==i]["HOUR"]
+    
+    #Need to drop the last hour from X and the first hour from Y
+    x_drop_index=dataX[(dataX.INDEX==i) & (data.HOUR==np.max(hours))].index
+    dataX=dataX.drop(x_drop_index,axis=0)
+
+    y_drop_index=dataY[(dataY.INDEX==i) & (data.HOUR==np.min(hours))].index
+    dataY=dataY.drop(y_drop_index,axis=0)
+
+#Drop actions from Y
+dataY=dataY.drop(["Heparin_1","Heparin_2","Heparin_3","Heparin_4","Heparin_5","Heparin_6"],axis=1)
+
+dataX_trim=dataX.drop(["INDEX","HOUR"],axis=1)
+dataY_trim=dataY.drop(["INDEX","HOUR"],axis=1)
+
+fulldata_x=data.drop(["INDEX","HOUR"],axis=1)
+fulldata_y=data.drop(["Heparin_1","Heparin_2","Heparin_3","Heparin_4","Heparin_5","Heparin_6"],axis=1)
+fulldata_y=fulldata_y.drop(["INDEX","HOUR"],axis=1)
+
+
+#Standardize variables based on same means and sds used in HMM training
+z_means=np.loadtxt("") #calculate or import means for all variables EXCEPT six heparin dosage variables
+z_std=np.loadtxt("") #calculate or import means for all variables EXCEPT six heparin dosage variables
+
+    #Standardize all variables except heparin dosage
+dataX_trim=(np.array(dataX_trim)-np.concatenate([z_means,[0,0,0,0,0,0]]))/np.concatenate([z_std,[1,1,1,1,1,1]])
+dataY_trim=(np.array(dataY_trim)-z_means)/z_std
+
+#Hold out 15\% validation set (310 patients)
+val_ids=np.random.choice(np.unique(data.INDEX),310,replace=False)
+
+dataX_trim_VAL=dataX_trim[dataX.INDEX.isin(val_ids),:]
+dataY_trim_VAL=dataY_trim[dataX.INDEX.isin(val_ids),:]
+
+dataX_trim_TRAIN=dataX_trim[~dataX.INDEX.isin(val_ids),:]
+dataY_trim_TRAIN=dataY_trim[~dataX.INDEX.isin(val_ids),:]
+
+dataX_trim_TRAIN=np.array(dataX_trim_TRAIN.drop("Unnamed: 0",axis=1))
+dataY_trim_TRAIN=np.array(dataY_trim_TRAIN.drop("Unnamed: 0",axis=1))
+dataX_trim_VAL=np.array(dataX_trim_VAL.drop("Unnamed: 0",axis=1))
+dataY_trim_VAL=np.array(dataY_trim_VAL.drop("Unnamed: 0",axis=1))
+
+
+#VAE model
+class VaeModel:
+    def __init__(self, kl_weight,batch_size,learning_rate=.05, latent_units=7, hidden_units=10, input_features=20,output_features=14):
+        self.kl_weight=kl_weight
+        self.input_features=input_features
+        self.output_features=output_features
+        self.learning_rate=learning_rate
+        self.batch_size=batch_size
+        self.hidden_units=hidden_units
+        self.latent_units=latent_units
+        self.define_model()
+        self.session=tf.Session()
+        self.session.run(self.initializer)
+        
+    def define_model(self):
+        self.model_input=tf.placeholder(dtype=tf.float32,shape=[self.batch_size,self.input_features])
+        self.encoder_hidden1=tf.layers.dense(self.model_input,self.hidden_units,activation=tf.nn.sigmoid,kernel_initializer=tf.constant_initializer(.1),name='encoder_hidden1')
+        self.z_mean=tf.layers.dense(self.encoder_hidden1,self.latent_units,kernel_initializer=tf.random_normal_initializer(),name='z_mean')
+        self.z_logvar=tf.layers.dense(self.encoder_hidden1,self.latent_units,kernel_initializer=tf.random_normal_initializer(),name='z_logvar')
+
+        def sampling(args):
+            z_mean, z_logvar=args
+            epsilon=tf.random.normal(shape=(self.batch_size,self.latent_units),mean=0,stddev=1)
+            return z_mean+tf.math.sqrt(tf.math.exp(z_logvar))*epsilon
+        
+        self.latent_hidden=tf.keras.layers.Lambda(sampling,output_shape=(self.batch_size,self.latent_units))([self.z_mean,self.z_logvar])
+        
+        self.decoder_hidden1=tf.layers.dense(self.latent_hidden,self.hidden_units,activation=tf.nn.sigmoid,kernel_initializer=tf.random_normal_initializer(),name='decoder_hidden1')
+        self.model_output=tf.layers.dense(self.decoder_hidden1,self.output_features,kernel_initializer=tf.random_normal_initializer(),name='model_output')
+        self.target_output=tf.placeholder(shape=[self.batch_size,self.output_features],dtype=tf.float32)
+
+        self.mse_loss=tf.reduce_mean(tf.keras.losses.MSE(self.target_output,self.model_output))
+        self.kl_loss=-0.5*tf.math.reduce_mean(1+self.z_logvar-tf.math.square(self.z_mean)-tf.math.exp(self.z_logvar))
+        self.loss=self.mse_loss+self.kl_loss
+        loss=self.mse_loss+self.kl_weight*self.kl_loss
+        
+        self.optimizer=tf.train.GradientDescentOptimizer(learning_rate=self.learning_rate).minimize(loss)
+        self.initializer=tf.global_variables_initializer()
+    
+    def train(self,input_data,output_data): #Make sure there are batch_size entries in each list
+        training_data={self.model_input: input_data, self.target_output: output_data}
+                
+        _,train_loss,mse_loss=self.session.run([self.optimizer, self.loss, self.mse_loss], feed_dict=training_data)
+        return train_loss, mse_loss
+        
+    def val_loss(self,val_input,val_output):
+        
+        validation_data={self.model_input: val_input, self.target_output: val_output}
+        val_loss,val_mse_loss=self.session.run([self.loss,self.mse_loss],feed_dict=validation_data)
+        return val_loss,val_mse_loss
+    
+    def next_state(self,current_state):
+        input_array=np.zeros([self.batch_size,len(list(current_state))])
+        input_array[0,:]=current_state
+        
+        next_state=self.session.run(self.model_output,feed_dict={self.model_input: input_array})
+        next_state=next_state[0,:]
+        
+        return next_state
+
+#TRAIN VAE
+tf.reset_default_graph()
+dataX_full=np.concatenate([dataX_trim_TRAIN,dataX_trim_VAL],axis=0)
+dataY_full=np.concatenate([dataY_trim_TRAIN,dataY_trim_VAL],axis=0)
+
+vae=VaeModel(batch_size=dataX_full.shape[0],input_features=20,output_features=14,kl_weight=.5)
+
+losses=[]
+mse_losses=[]
+for i in range(1000):
+    if i%10==0:
+        print(i)
+    new_loss, new_mse_loss=vae.train(input_data=dataX_trim_TRAIN,output_data=dataY_trim_TRAIN)
+    losses.append(new_loss)
+    mse_losses.append(new_mse_loss)
+    
+plt.plot(losses)
+plt.plot(mse_losses)
+    
+#Save to .csv's
+encoder1_weights=tf.get_default_graph().get_tensor_by_name('encoder_hidden1/kernel:0').eval(session=vae.session)
+encoder1_bias=tf.get_default_graph().get_tensor_by_name('encoder_hidden1/bias:0').eval(session=vae.session)
+z_mean_weights=tf.get_default_graph().get_tensor_by_name('z_mean/kernel:0').eval(session=vae.session)
+z_mean_bias=tf.get_default_graph().get_tensor_by_name('z_mean/bias:0').eval(session=vae.session)
+z_logvar_weights=tf.get_default_graph().get_tensor_by_name('z_logvar/kernel:0').eval(session=vae.session)
+z_logvar_bias=tf.get_default_graph().get_tensor_by_name('z_logvar/bias:0').eval(session=vae.session)
+decoder1_weights=tf.get_default_graph().get_tensor_by_name('decoder_hidden1/kernel:0').eval(session=vae.session)
+decoder1_bias=tf.get_default_graph().get_tensor_by_name('decoder_hidden1/bias:0').eval(session=vae.session)
+output_weights=tf.get_default_graph().get_tensor_by_name('model_output/kernel:0').eval(session=vae.session)
+output_bias=tf.get_default_graph().get_tensor_by_name('model_output/bias:0').eval(session=vae.session)
+
+#HMM benchmark
+import hmmlearn
+from hmmlearn import hmm
+import pandas as pd
+import numpy as np
+
+#Character codes: t for transmat_, s for startprob_, m for means_, c for covars_
+fulldata=pd.read_csv("") #import full dataset
+fulldata=fulldata.drop("Unnamed: 0",axis=1)
+
+hmmdata=fulldata[["INDEX","HOUR","aPTT","CO2_sig","HR_sig","creat_sig","gcs_sig","hematocrit_sig","hemoglobin_sig","inr_sig","plat_sig","pt_sig","spo2_sig","temp_sig","urea_sig","wbc_sig"]]
+
+unique,counts=np.unique(hmmdata.INDEX,return_counts=True) #Get number of unique counts
+
+hmmdata_std=hmmdata.drop(["INDEX","HOUR"],axis=1)
+z_means=np.mean(np.array(hmmdata_std),axis=0)
+z_std=np.std(np.array(hmmdata_std),axis=0)
+hmmdata_std=(np.array(hmmdata_std)-z_means)/z_std
+
+np.savetxt("",z_means,delimiter=",")
+np.savetxt("",z_std,delimiter=",")
+
+    #choose number of states based on lowest log-likelihood
+final_likelihood=[]
+for n_states in [11]:
+    state_ll=[]
+    
+    for start in range(5):
+        model=hmm.GaussianHMM(n_components=n_states,covariance_type='diag',init_params='tcms',params='tcms')
+        model.tol=.85 #Roughly .000001
+        model.n_iter=1000
+        model.verbose=True
+        model.fit(hmmdata_std,counts)
+        state_ll.append(model.monitor_.history[1])
+    final_likelihood.append(np.min(state_ll))
+
+final_likelihood=[]
+    
+    #BIC is k*log(n)-2*LL
+    #Calculate number of parameters
+k=[n_states+n_states**2+2*n_states for n_states in [3,4,5,6,7,8,9,10,11]]
+
+BIC=np.array(k)*np.log(hmmdata.shape[0])-2*np.array(final_likelihood)
+
+#BIC kept getting lower after 10
+n_states=10
+model=hmm.GaussianHMM(n_components=n_states,covariance_type='diag',init_params='tcms',params='tcms')
+model.tol=.001
+model.n_iter=1000
+model.verbose=True
+model.fit(hmmdata_std,counts)
+
+_, state_counts=np.unique(model.predict(hmmdata_std),return_counts=True)
+
+#Going with 10 state model
+#Save means and SDs
+var_matrix=np.array([np.diagonal(model.covars_[state]) for state in range(n_states)])
+var_matrix=np.delete(var_matrix,9,axis=0)
+
+mean_matrix=np.delete(model.means_,9,axis=0)
+startprob_vec=np.delete(model.startprob_,9)
+startprob_vec=startprob_vec/np.sum(startprob_vec)
+np.savetxt("",startprob_vec,delimiter=",")
+np.savetxt("",mean_matrix,delimiter=",")
+np.savetxt("",var_matrix,delimiter=",")
+
+#Now need to break into subsequences based on dosages
+fulldata["Action"]=fulldata.Heparin_1+fulldata.Heparin_2*2+fulldata.Heparin_3*3+fulldata.Heparin_4*4+fulldata.Heparin_5*5+fulldata.Heparin_6*6
+
+augmented_df=pd.DataFrame()
+
+start=0
+seq_id_counter=0
+
+for i in range(1,fulldata.shape[0]):
+    if i%1000==0:
+        print(i)
+    
+    new_index=fulldata.loc[i,"INDEX"]
+    new_action=fulldata.loc[i,"Action"]
+       
+    if ((new_index==prev_index) & (new_action!=prev_action)) or (i==(fulldata.shape[0]-1)):
+        subset=fulldata.loc[start:i,:]
+        subset["SEQ_ID"]=seq_id_counter
+        subset.loc[:,"Action"]=prev_action
+        augmented_df=augmented_df.append(subset)
+        
+        start=i
+        seq_id_counter=seq_id_counter+1
+    
+    if (new_index!=prev_index):
+        if start!=(i-1):
+            subset=fulldata.loc[start:(i-1),:]
+            subset["SEQ_ID"]=seq_id_counter
+            augmented_df=augmented_df.append(subset)
+            seq_id_counter=seq_id_counter+1
+        start=i
+    prev_action=new_action
+    prev_index=new_index
+
+augmented_df.to_csv("")
+
+#Only do this if limiting to training data
+augmented_df=pd.read_csv("")
+val_ids=np.loadtxt("",delimiter=",")
+augmented_df=augmented_df[~augmented_df.INDEX.isin(val_ids)]
+
+hep1_std=augmented_df[augmented_df.Action==1]
+hep2_std=augmented_df[augmented_df.Action==2]
+hep3_std=augmented_df[augmented_df.Action==3]
+hep4_std=augmented_df[augmented_df.Action==4]
+hep5_std=augmented_df[augmented_df.Action==5]
+hep6_std=augmented_df[augmented_df.Action==6]
+
+_, hep1_counts=np.unique(hep1_std["SEQ_ID"],return_counts=True)
+_, hep2_counts=np.unique(hep2_std["SEQ_ID"],return_counts=True)
+_, hep3_counts=np.unique(hep3_std["SEQ_ID"],return_counts=True)
+_, hep4_counts=np.unique(hep4_std["SEQ_ID"],return_counts=True)
+_, hep5_counts=np.unique(hep5_std["SEQ_ID"],return_counts=True)
+_, hep6_counts=np.unique(hep6_std["SEQ_ID"],return_counts=True)
+
+hep1_std=np.array(hep1_std[["aPTT","CO2_sig","HR_sig","creat_sig","gcs_sig","hematocrit_sig","hemoglobin_sig","inr_sig","plat_sig","pt_sig","spo2_sig","temp_sig","urea_sig","wbc_sig"]])
+hep2_std=np.array(hep2_std[["aPTT","CO2_sig","HR_sig","creat_sig","gcs_sig","hematocrit_sig","hemoglobin_sig","inr_sig","plat_sig","pt_sig","spo2_sig","temp_sig","urea_sig","wbc_sig"]])
+hep3_std=np.array(hep3_std[["aPTT","CO2_sig","HR_sig","creat_sig","gcs_sig","hematocrit_sig","hemoglobin_sig","inr_sig","plat_sig","pt_sig","spo2_sig","temp_sig","urea_sig","wbc_sig"]])
+hep4_std=np.array(hep4_std[["aPTT","CO2_sig","HR_sig","creat_sig","gcs_sig","hematocrit_sig","hemoglobin_sig","inr_sig","plat_sig","pt_sig","spo2_sig","temp_sig","urea_sig","wbc_sig"]])
+hep5_std=np.array(hep5_std[["aPTT","CO2_sig","HR_sig","creat_sig","gcs_sig","hematocrit_sig","hemoglobin_sig","inr_sig","plat_sig","pt_sig","spo2_sig","temp_sig","urea_sig","wbc_sig"]])
+hep6_std=np.array(hep6_std[["aPTT","CO2_sig","HR_sig","creat_sig","gcs_sig","hematocrit_sig","hemoglobin_sig","inr_sig","plat_sig","pt_sig","spo2_sig","temp_sig","urea_sig","wbc_sig"]])
+
+z_means=np.loadtxt("",delimiter=",")
+z_std=np.loadtxt("",delimiter=",")
+hep1_std=(np.array(hep1_std)-z_means)/z_std
+hep2_std=(np.array(hep2_std)-z_means)/z_std
+hep3_std=(np.array(hep3_std)-z_means)/z_std
+hep4_std=(np.array(hep4_std)-z_means)/z_std
+hep5_std=(np.array(hep5_std)-z_means)/z_std
+hep6_std=(np.array(hep6_std)-z_means)/z_std
+
+#Create separate HMM models
+n_states=9 #REMOVE STATE 7 from model due to low visitation
+
+fixed_startprob=np.loadtxt("",delimiter=",")
+fixed_means=np.loadtxt("",delimiter=",")
+fixed_var_matrix=np.loadtxt("",delimiter=",")
+
+model1=hmm.GaussianHMM(n_components=n_states,covariance_type='diag',init_params="t",params="t")
+model1.startprob_=fixed_startprob
+model1.means_=fixed_means
+model1.covars_=fixed_var_matrix
+
+model1.tol=.001; model1.n_iter=1000; model1.verbose=True
+model1.fit(hep1_std,hep1_counts)
+
+model2=hmm.GaussianHMM(n_components=n_states,covariance_type='diag',init_params="t",params="t")
+model2.startprob_=fixed_startprob
+model2.means_=fixed_means
+model2.covars_=fixed_var_matrix
+
+model2.tol=.001; model2.n_iter=1000; model2.verbose=True
+model2.fit(hep2_std,hep2_counts)
+
+model3=hmm.GaussianHMM(n_components=n_states,covariance_type='diag',init_params="t",params="t")
+model3.startprob_=fixed_startprob
+model3.means_=fixed_means
+model3.covars_=fixed_var_matrix
+
+model3.tol=.001; model3.n_iter=1000; model3.verbose=True
+model3.fit(hep3_std,hep3_counts)
+
+model4=hmm.GaussianHMM(n_components=n_states,covariance_type='diag',init_params="t",params="t")
+model4.startprob_=fixed_startprob
+model4.means_=fixed_means
+model4.covars_=fixed_var_matrix
+
+model4.tol=.001; model4.n_iter=1000; model4.verbose=True
+model4.fit(hep4_std,hep4_counts)
+
+model5=hmm.GaussianHMM(n_components=n_states,covariance_type='diag',init_params="t",params="t")
+model5.startprob_=fixed_startprob
+model5.means_=fixed_means
+model5.covars_=fixed_var_matrix
+
+model5.tol=.001; model5.n_iter=1000; model5.verbose=True
+model5.fit(hep5_std,hep5_counts)
+
+model6=hmm.GaussianHMM(n_components=n_states,covariance_type='diag',init_params="t",params="t")
+model6.startprob_=fixed_startprob
+model6.means_=fixed_means
+model6.covars_=fixed_var_matrix
+
+model6.tol=.001; model6.n_iter=1000; model6.verbose=True
+model6.fit(hep6_std,hep6_counts)
+
+#Check state visitation
+_, statecounts1=np.unique(model1.predict(hep1_std),return_counts=True)
+_, statecounts2=np.unique(model2.predict(hep2_std),return_counts=True)
+_, statecounts3=np.unique(model3.predict(hep3_std),return_counts=True)
+_, statecounts4=np.unique(model4.predict(hep4_std),return_counts=True)
+_, statecounts5=np.unique(model5.predict(hep5_std),return_counts=True)
+_, statecounts6=np.unique(model6.predict(hep6_std),return_counts=True)
+
+np.savetxt("",np.array([statecounts1,statecounts2,statecounts3,statecounts4,statecounts5,statecounts6]),delimiter=",")
+
+#Save transition probabilities - currently set to TRAIN
+np.savetxt("",model1.transmat_,delimiter=",")
+np.savetxt("",model2.transmat_,delimiter=",")
+np.savetxt("",model3.transmat_,delimiter=",")
+np.savetxt("",model4.transmat_,delimiter=",")
+np.savetxt("",model5.transmat_,delimiter=",")
+np.savetxt("",model6.transmat_,delimiter=",")
+
+
+#LSTM benchmark
+tf.enable_eager_execution()
+    
+ids, seq_lengths=np.unique(data.INDEX,return_counts=True)
+seq_lengths=seq_lengths-1
+
+train_ids=ids[~np.isin(ids,val_ids)]
+
+_, train_counts=np.unique(data[data.INDEX.isin(train_ids)]["INDEX"],return_counts=True)
+train_counts=train_counts-1
+
+_, val_counts=np.unique(data[data.INDEX.isin(val_ids)]["INDEX"],return_counts=True)
+val_counts=val_counts-1
+
+lstm_X_train=np.zeros([len(ids)-len(val_ids),np.max(seq_lengths),20]) #Train ids only
+lstm_Y_train=np.zeros([len(ids)-len(val_ids),np.max(seq_lengths),14]) #Train ids only
+lstm_X_val=np.zeros([len(val_ids),np.max(seq_lengths),20]) #Train ids only
+lstm_Y_val=np.zeros([len(val_ids),np.max(seq_lengths),14]) #Train ids only
+
+start=0
+for i in range(lstm_X_train.shape[0]):
+    _id=train_ids[i]
+    length=train_counts[i]
+    end=start+length
+     
+    xdat=dataX_trim_TRAIN[start:end,:]
+    ydat=dataY_trim_TRAIN[start:end,:]
+    lstm_X_train[i,(-1*length):,:]=xdat
+    lstm_Y_train[i,(-1*length):,:]=ydat
+    start=end
+
+start=0
+for i in range(lstm_X_val.shape[0]):
+    _id=val_ids[i]
+    length=val_counts[i]
+    end=start+length
+     
+    xdat=dataX_trim_VAL[start:end,:]
+    ydat=dataY_trim_VAL[start:end,:]
+    lstm_X_val[i,(-1*length):,:]=xdat
+    lstm_Y_val[i,(-1*length):,:]=ydat
+    start=end
+
+    #Code LSTM
+class LSTMModel:
+    def __init__(self, batch_size,seq_length=47, hidden_units=10, input_features=20,output_features=14):
+        self.seq_length=seq_length
+        self.input_features=input_features
+        self.output_features=output_features
+        self.batch_size=batch_size
+        self.hidden_units=hidden_units
+        self.define_model()
+        #self.session=tf.Session()
+        #self.session.run(self.initializer)
+        
+    def define_model(self):
+        self.model=tf.keras.Sequential([
+            tf.keras.layers.LSTM(units=self.hidden_units,activation='tanh',input_shape=[self.seq_length,self.input_features],return_sequences=True,use_bias=False),
+            tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(self.output_features,activation='linear',use_bias=False))                
+            ])
+        optimizer=tf.train.AdamOptimizer(learning_rate=.01)
+        self.model.compile(optimizer=optimizer,loss='mse')
+        
+    def train(self,input_data,output_data,validation_list=[],ep_num=1000):
+        self.fit=self.model.fit(input_data,output_data,batch_size=input_data.shape[0],epochs=ep_num,verbose=1,validation_data=validation_list)
+    
+lstm=LSTMModel(batch_size=dataX_trim_TRAIN.shape[0])
+lstm.train(lstm_X_train,lstm_Y_train,validation_list=[lstm_X_val,lstm_Y_val],ep_num=1000)
+
+plt.plot(lstm.fit.history['loss'])
+
+    #Re-train LSTM on entire dataset
+lstm_X_full=np.concatenate([lstm_X_train,lstm_X_val],axis=0)
+lstm_Y_full=np.concatenate([lstm_Y_train,lstm_Y_val],axis=0)
+
+lstm=LSTMModel(batch_size=lstm_X_full.shape[0])
+lstm.train(lstm_X_full,lstm_Y_full,ep_num=1000)
+
+plt.plot(lstm.fit.history['loss'])
+    #Save model weights
+
+    #Train only on training dataset
+lstm=LSTMModel(batch_size=lstm_X_train.shape[0])
+lstm.train(lstm_X_train,lstm_Y_train,ep_num=1000)
+#lstm.model.save_weights("C:/Users/bauc9/OneDrive - University of Tennessee/Documents/Projects/VAE for RL/lstm_weights_TRAIN.h5")
+
+
+#Save variable SDs for LSTM generative model
+dataX_full=np.concatenate([dataX_trim_TRAIN[:,0:14],dataX_trim_VAL[:,0:14]],axis=0)
+dataY_full=np.concatenate([dataY_trim_TRAIN[:,0:14],dataY_trim_VAL[:,0:14]],axis=0)
+np.savetxt("C:/Users/bauc9/OneDrive - University of Tennessee/Documents/Projects/VAE for RL/lstm_sds.txt
+
+#CONDITIONAL GAN
+tf.reset_default_graph()
+state=keras.Input(batch_shape=(None,20))
+    #Just create single input with 7 latent units appended to end
+def add_noise(_input):
+    epsilon=K.random_normal(shape=(K.shape(_input)[0],7),mean=0,stddev=1)
+    return K.concatenate([_input,epsilon],axis=1)
+
+noise_layer=keras.layers.Lambda(add_noise,name='noise_layer')(state)
+gen_hidden=keras.layers.Dense(units=10,activation='sigmoid',name="gen_hidden")(noise_layer)
+gen_output=keras.layers.Dense(units=14,activation='linear',name="gen_output")(gen_hidden)
+concat_output=keras.layers.concatenate([state,gen_output],name="concat_output")
+generator=keras.Model(state,concat_output)
+
+dis_input=keras.Input(batch_shape=(None,34))
+dis_hidden=keras.layers.Dense(units=10,activation='sigmoid',name="dis_hidden")(dis_input)
+dis_output=keras.layers.Dense(1,activation='sigmoid',name="dis_output")(dis_hidden)
+discriminator=keras.Model(dis_input,dis_output)
+discriminator.compile(loss='binary_crossentropy',optimizer=keras.optimizers.Adam(lr=.0004))
+
+def define_gan(generator,discriminator):
+    discriminator.trainable=False
+    gan=keras.models.Sequential()
+    gan.add(generator)
+    gan.add(discriminator)
+    opt=keras.optimizers.Adam(lr=.0001)
+    gan.compile(loss='binary_crossentropy',optimizer=opt)
+    return gan
+
+gan_model=define_gan(generator,discriminator)
+
+    #Train on whole dataset
+dataX_full=np.concatenate([dataX_trim_TRAIN,dataX_trim_VAL],axis=0)
+dataY_full=np.concatenate([dataY_trim_TRAIN,dataY_trim_VAL],axis=0)
+
+dis_losses=[];gen_losses=[];loss_diff=[]
+
+i=-1
+early_stop=False
+while early_stop==False:
+    i+=1
+    if i%10==0:
+        print(i)
+    fake_sequences=generator.predict(dataX_full)
+    dx=np.concatenate([fake_sequences,
+        np.concatenate([dataX_full,dataY_full],axis=1)],axis=0)
+    dy=np.concatenate([np.zeros((dataX_full.shape[0],1)),np.ones((dataX_full.shape[0],1))],axis=0)
+    dis_losses.append(discriminator.train_on_batch(dx,dy))   
+    gy=np.ones((dataX_full.shape[0],1))
+    gen_losses.append(gan_model.train_on_batch(dataX_full,gy))
+    loss_diff.append(np.abs(gen_losses[-1]-dis_losses[-1]))
+
+    if i>0:
+        diff=(loss_diff[-1]-loss_diff[-2])/loss_diff[-2]
+        if (diff<0) and (diff>-.0001) and (i>800):
+            early_stop=True
+        if i==1000:
+            early_stop=True
+
+
+plt.plot(gen_losses);plt.plot(dis_losses)
+
+gan_model.save_weights("")
+
+gan_hidden_weights=gan_model.get_weights()[0]
+gan_hidden_bias=gan_model.get_weights()[1]
+gan_output_weights=gan_model.get_weights()[2]
+gan_output_bias=gan_model.get_weights()[3]
+
+
+#Conditional VAE
+dataX_full=np.concatenate([dataX_trim_TRAIN,dataX_trim_VAL],axis=0)
+dataY_full=np.concatenate([dataY_trim_TRAIN,dataY_trim_VAL],axis=0)
+
+tf.reset_default_graph()
+
+class CvaeModel:
+    def __init__(self, batch_size,learning_rate=.05, latent_units=7, hidden_units=10, input_features=14,output_features=14,kl_weight=1):
+        self.input_features=input_features
+        self.output_features=output_features
+        self.learning_rate=learning_rate
+        self.batch_size=batch_size
+        self.hidden_units=hidden_units
+        self.latent_units=latent_units
+        self.kl_weight=kl_weight
+        self.define_model()
+        self.session=tf.Session()
+        self.session.run(self.initializer)
+        
+    def define_model(self):
+        self.next_state=tf.placeholder(dtype=tf.float32,shape=[self.batch_size,self.input_features])
+        self.current_state=tf.placeholder(dtype=tf.float32,shape=[self.batch_size,20])
+        self.encoder_input=tf.concat([self.next_state,self.current_state],axis=1)
+        self.encoder_hidden1=tf.layers.dense(self.encoder_input,self.hidden_units,activation=tf.nn.sigmoid,kernel_initializer=tf.constant_initializer(.1),name='encoder_hidden1')
+        self.z_mean=tf.layers.dense(self.encoder_hidden1,self.latent_units,kernel_initializer=tf.random_normal_initializer(),name='z_mean')
+        self.z_logvar=tf.layers.dense(self.encoder_hidden1,self.latent_units,kernel_initializer=tf.random_normal_initializer(),name='z_logvar')
+
+        def sampling(args):
+            z_mean, z_logvar=args
+            epsilon=tf.random.normal(shape=(self.batch_size,self.latent_units),mean=0,stddev=1)
+            return z_mean+tf.math.sqrt(tf.math.exp(z_logvar))*epsilon
+        
+        self.latent_hidden=tf.keras.layers.Lambda(sampling,output_shape=(self.batch_size,self.latent_units))([self.z_mean,self.z_logvar])
+        self.decoder_input=tf.concat([self.latent_hidden,self.current_state],axis=1) 
+        
+        self.decoder_hidden1=tf.layers.dense(self.decoder_input,self.hidden_units,activation=tf.nn.sigmoid,kernel_initializer=tf.random_normal_initializer(),name='decoder_hidden1')
+        self.model_output=tf.layers.dense(self.decoder_hidden1,self.output_features,kernel_initializer=tf.random_normal_initializer(),name='model_output')
+        self.target_output=tf.placeholder(shape=[self.batch_size,self.output_features],dtype=tf.float32)
+
+        self.mse_loss=tf.reduce_mean(tf.keras.losses.MSE(self.target_output,self.model_output))
+        self.kl_loss=-0.5*tf.math.reduce_mean(1+self.z_logvar-tf.math.square(self.z_mean)-tf.math.exp(self.z_logvar))
+        self.loss=self.mse_loss+self.kl_weight*self.kl_loss
+        loss=self.mse_loss+self.kl_weight*self.kl_loss
+        
+        self.optimizer=tf.train.GradientDescentOptimizer(learning_rate=self.learning_rate).minimize(loss)
+        self.initializer=tf.global_variables_initializer()
+    
+    def train(self,input_data,output_data): #Make sure there are batch_size entries in each list
+        training_data={self.current_state: input_data, self.next_state: output_data, self.target_output: output_data}
+                
+        _,trainloss, mseloss=self.session.run([self.optimizer, self.loss, self.mse_loss], feed_dict=training_data)
+        return trainloss, mseloss
+        
+    def val_loss(self,val_input,val_output):
+        
+        validation_data={self.model_input: val_input, self.target_output: val_output}
+        val_loss_value=self.session.run(self.loss, feed_dict=validation_data)
+        return val_loss_value
+
+    def get_latent(self,_input,_output):
+        _data={self.current_state: _input, self.next_state: _output, self.target_output: _output}
+        _zmean,_zlogvar=self.session.run([self.z_mean,self.z_logvar], feed_dict=_data)
+        return _zmean,_zlogvar
+
+cvae=CvaeModel(batch_size=dataX_trim_TRAIN.shape[0],kl_weight=.25)
+
+losses=[]
+mse_losses=[]
+for i in range(1000):
+    if i%10==0:
+        print(i)
+    new_loss, new_mse_loss=cvae.train(input_data=dataX_trim_TRAIN,output_data=dataY_trim_TRAIN)
+    losses.append(new_loss)
+    mse_losses.append(new_mse_loss)
+    
+plt.plot(losses)
+plt.plot(mse_losses)
+
+#Get z_means and logvars
+_zmeans, _zlogvars=cvae.get_latent(_input=dataX_trim_TRAIN,_output=dataY_trim_TRAIN)
+
+plt.hist(_zmeans.reshape(-1))
+plt.hist(np.sqrt(np.exp(_zlogvars.reshape(-1))))
+
+np.savetxt("C:/Users/bauc9/OneDrive - University of Tennessee/Documents/Projects/VAE for RL/cvae_zmeans",_zmeans,delimiter=",")
+np.savetxt("C:/Users/bauc9/OneDrive - University of Tennessee/Documents/Projects/VAE for RL/cvae_zlogvar",_zlogvars,delimiter=",")
+
+_zmeans=np.loadtxt("C:/Users/bauc9/OneDrive - University of Tennessee/Documents/Projects/VAE for RL/cvae_zmeans",delimiter=",")
+_zlogvars=np.loadtxt("C:/Users/bauc9/OneDrive - University of Tennessee/Documents/Projects/VAE for RL/cvae_zlogvar",delimiter=",")
+
+
+#Save to .csv's
+cvae_encoder1_weights=tf.get_default_graph().get_tensor_by_name('encoder_hidden1/kernel:0').eval(session=cvae.session)
+cvae_encoder1_bias=tf.get_default_graph().get_tensor_by_name('encoder_hidden1/bias:0').eval(session=cvae.session)
+cvae_z_mean_weights=tf.get_default_graph().get_tensor_by_name('z_mean/kernel:0').eval(session=cvae.session)
+cvae_z_mean_bias=tf.get_default_graph().get_tensor_by_name('z_mean/bias:0').eval(session=cvae.session)
+cvae_z_logvar_weights=tf.get_default_graph().get_tensor_by_name('z_logvar/kernel:0').eval(session=cvae.session)
+cvae_z_logvar_bias=tf.get_default_graph().get_tensor_by_name('z_logvar/bias:0').eval(session=cvae.session)
+cvae_decoder1_weights=tf.get_default_graph().get_tensor_by_name('decoder_hidden1/kernel:0').eval(session=cvae.session)
+cvae_decoder1_bias=tf.get_default_graph().get_tensor_by_name('decoder_hidden1/bias:0').eval(session=cvae.session)
+cvae_output_weights=tf.get_default_graph().get_tensor_by_name('model_output/kernel:0').eval(session=cvae.session)
+cvae_output_bias=tf.get_default_graph().get_tensor_by_name('model_output/bias:0').eval(session=cvae.session)
+
+
+
+
